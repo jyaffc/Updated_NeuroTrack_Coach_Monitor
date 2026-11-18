@@ -1,0 +1,4 @@
+# Python receiver dependencies (all support Python 3.13+)
+bleak
+numpy
+matplotlib

@@ -12,6 +12,10 @@ This app is built as a polished demo and MVP front end for a wearable prototype 
 - Athlete detail pages with event timeline, direction mix, and cumulative load trend
 - Session summary page for presentation-ready recap and export
 
+## Headband device
+
+The ESP32 sketch and the Python receiver that produce the data live in [`device/`](device/README.md), with wiring, Arduino IDE settings, and calibration steps.
+
 ## Uploading headband data
 
 The intake page reads the CSV written by `head_impact_receiver.py` as is, plus any coach export with player and intensity columns.
