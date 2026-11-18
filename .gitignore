@@ -54,3 +54,8 @@ next-env.d.ts
 # python
 __pycache__/
 *.pyc
+
+# receiver session output (athlete data stays local)
+impact_log_*.csv
+impact_log_*.json
+headband_setup.json

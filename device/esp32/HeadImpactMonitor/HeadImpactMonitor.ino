@@ -43,6 +43,17 @@
 //   for the magnetometer. To erase the saved calibration, hold the BOOT
 //   button for 3 seconds while the sketch is running.
 //
+// PLAYER ID:
+//   Set PLAYER_ID below before flashing each headband. The Python receiver
+//   reads it on connect and writes it into every CSV row.
+//
+// BLE CHARACTERISTICS:
+//   CHAR_UUID_IMU    NOTIFY  47-byte IMU packet at 100 Hz (format below)
+//   CHAR_UUID_PLAYER READ    PLAYER_ID text
+//   CHAR_UUID_CMD    WRITE   Text commands from Python:
+//                              "RECAL" -> erase saved calibration and restart
+//                                         the BNO055 so it recalibrates
+//
 // BLE DATA FORMAT (47 bytes per notification, little-endian):
 //   bytes  0-15 : qw, qx, qy, qz            (float32 x4) orientation quaternion
 //   bytes 16-27 : linAccX, linAccY, linAccZ (float32 x3) m/s^2, gravity removed
@@ -87,10 +98,16 @@
 // How often the calibration status is re-read from the BNO055 (ms)
 #define CAL_REFRESH_MS  250
 
+// Player / headband identifier, readable by the Python receiver.
+// Change it before flashing each headband (e.g. "Headband-02").
+#define PLAYER_ID  "Headband-01"
+
 // BLE device name and UUIDs - must match the Python receiver exactly
-#define BLE_DEVICE_NAME  "HeadImpactMonitor"
-#define SERVICE_UUID     "12345678-1234-1234-1234-123456789abc"
-#define CHAR_UUID_IMU    "abcd1234-ab12-ab12-ab12-abcdef123456"
+#define BLE_DEVICE_NAME   "HeadImpactMonitor"
+#define SERVICE_UUID      "12345678-1234-1234-1234-123456789abc"
+#define CHAR_UUID_IMU     "abcd1234-ab12-ab12-ab12-abcdef123456"
+#define CHAR_UUID_PLAYER  "abcd1234-ab12-ab12-ab12-abcdef123457"
+#define CHAR_UUID_CMD     "abcd1234-ab12-ab12-ab12-abcdef123458"
 
 // Requested BLE packet size limit (MTU). The default allows only 20 bytes per
 // notification; 185 leaves room for the 47-byte packet on any PC.
@@ -148,6 +165,10 @@ uint8_t calSys = 0, calGyro = 0, calAccel = 0, calMag = 0;
 bool     calibrationSavedThisBoot = false; // save offsets at most once per power-up
 uint16_t packetSequence           = 0;     // increments with every BLE packet
 
+// Set by the BLE command callback, handled in loop(). Sensor (I2C) work is
+// kept out of the BLE callback because that runs inside the Bluetooth task.
+volatile bool recalRequested = false;
+
 
 // =============================================================================
 // BLE SERVER CALLBACKS
@@ -162,6 +183,23 @@ class ServerCallbacks : public BLEServerCallbacks {
     void onDisconnect(BLEServer* server) override {
         deviceConnected = false;
         Serial.println("[BLE] Client disconnected - restarting advertising");
+    }
+};
+
+// Receives text commands written by the Python receiver
+class CommandCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* characteristic) override {
+        // getValue() returns std::string on ESP32 core 2.x and String on 3.x;
+        // c_str() works for both
+        String command = String(characteristic->getValue().c_str());
+        command.trim();
+        command.toUpperCase();
+        if (command == "RECAL") {
+            recalRequested = true;   // handled in loop()
+        } else {
+            Serial.print("[CMD] Unknown command: ");
+            Serial.println(command);
+        }
     }
 };
 
@@ -208,6 +246,42 @@ void eraseCalibration() {
     Serial.println("[CAL] Saved calibration erased - recalibrate from scratch");
 }
 
+// Starts (or restarts) the BNO055 in NDOF fusion mode.
+// restoreSaved = true loads the calibration saved in flash.
+bool startSensor(bool restoreSaved) {
+    Serial.print("[IMU] Starting BNO055 at I2C address 0x");
+    Serial.println(BNO055_I2C_ADDR, HEX);
+
+    if (!bno.begin()) {   // begin() also starts the I2C bus and resets fusion
+        Serial.println("[ERROR] BNO055 not detected. Check wiring:");
+        Serial.println("        VIN -> 3V3, GND -> GND");
+        Serial.println("        SDA -> GPIO 21, SCL -> GPIO 22");
+        Serial.println("        ADR -> GND (for address 0x28)");
+        return false;
+    }
+    Wire.setClock(I2C_CLOCK_HZ);  // Faster reads once the sensor is found
+    Serial.println("[IMU] BNO055 running (NDOF fusion mode, 100 Hz)");
+
+    // Restore saved calibration before switching on the external crystal
+    if (restoreSaved) {
+        restoreCalibration();
+    }
+    bno.setExtCrystalUse(true);  // More accurate timing for the fusion algorithm
+    return true;
+}
+
+// Handles the "RECAL" command: forget saved calibration and restart the sensor
+// so all calibration levels start again from 0
+void recalibrateSensor() {
+    Serial.println("[CMD] RECAL received - restarting the BNO055");
+    eraseCalibration();
+    if (!startSensor(false)) {
+        Serial.println("[ERROR] BNO055 did not restart - check wiring, then press EN");
+    }
+    calSys = calGyro = calAccel = calMag = 0;
+    Serial.println("[CAL] Do the calibration routine again (still, 6 orientations, figure-8)");
+}
+
 // Reads the four calibration levels from the BNO055
 void refreshCalibration() {
     bno.getCalibration(&calSys, &calGyro, &calAccel, &calMag);
@@ -234,25 +308,12 @@ void setup() {
     pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);  // BOOT button reads LOW when pressed
 
     // --- BNO055 over I2C (GPIO 21 = SDA, GPIO 22 = SCL) ---
-    Serial.print("[IMU] Initializing BNO055 at I2C address 0x");
-    Serial.println(BNO055_I2C_ADDR, HEX);
-
-    if (!bno.begin()) {   // begin() also starts the I2C bus
-        Serial.println("[ERROR] BNO055 not detected. Check wiring:");
-        Serial.println("        VIN -> 3V3, GND -> GND");
-        Serial.println("        SDA -> GPIO 21, SCL -> GPIO 22");
-        Serial.println("        ADR -> GND (for address 0x28)");
+    if (!startSensor(true)) {
         Serial.println("  Halting. Fix wiring and press EN to retry.");
         while (true) {
             delay(1000);
         }
     }
-    Wire.setClock(I2C_CLOCK_HZ);  // Faster reads once the sensor is found
-    Serial.println("[IMU] BNO055 detected (NDOF fusion mode, 100 Hz)");
-
-    // Restore saved calibration before switching on the external crystal
-    restoreCalibration();
-    bno.setExtCrystalUse(true);  // More accurate timing for the fusion algorithm
 
     // --- BLE ---
     BLEDevice::init(BLE_DEVICE_NAME);
@@ -269,6 +330,21 @@ void setup() {
         BLECharacteristic::PROPERTY_NOTIFY
     );
     pIMUCharacteristic->addDescriptor(new BLE2902());  // Lets the client subscribe
+
+    // READ: headband identifier for the Python receiver
+    BLECharacteristic* pPlayerCharacteristic = pService->createCharacteristic(
+        CHAR_UUID_PLAYER,
+        BLECharacteristic::PROPERTY_READ
+    );
+    pPlayerCharacteristic->setValue((uint8_t*)PLAYER_ID, strlen(PLAYER_ID));
+
+    // WRITE: text commands from the Python receiver (e.g. "RECAL")
+    BLECharacteristic* pCommandCharacteristic = pService->createCharacteristic(
+        CHAR_UUID_CMD,
+        BLECharacteristic::PROPERTY_WRITE
+    );
+    pCommandCharacteristic->setCallbacks(new CommandCallbacks());
+
     pService->start();
 
     BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
@@ -277,7 +353,10 @@ void setup() {
     BLEDevice::startAdvertising();
 
     Serial.print("[BLE] Advertising as ");
-    Serial.println(BLE_DEVICE_NAME);
+    Serial.print(BLE_DEVICE_NAME);
+    Serial.print("  (player ID: ");
+    Serial.print(PLAYER_ID);
+    Serial.println(")");
     Serial.println();
     Serial.println("----------------------------------------------");
     Serial.println("  CALIBRATION");
@@ -312,6 +391,13 @@ void loop() {
     if (deviceConnected && !oldDeviceConnected) {
         oldDeviceConnected = true;
         packetSequence = 0;  // Restart the counter for each connection
+    }
+
+    // --- "RECAL" command from the Python receiver ---
+    if (recalRequested) {
+        recalRequested = false;
+        recalibrateSensor();
+        calibrationSavedThisBoot = false;   // allow saving the new calibration
     }
 
     // --- BOOT button held for 3 s: erase saved calibration ---

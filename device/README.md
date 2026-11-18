@@ -8,7 +8,7 @@ BNO055 --I2C--> ESP32-SOLO-1 --BLE (47-byte packets, 100 Hz)--> head_impact_rece
 
 ## Folders
 
-- `esp32/HeadImpactMonitor/HeadImpactMonitor.ino` – Arduino sketch for the ESP32. Keep it inside the `HeadImpactMonitor` folder; the Arduino IDE needs the folder and file names to match.
+- `esp32/HeadImpactMonitor/HeadImpactMonitor.ino` – Arduino sketch for the ESP32. Set `PLAYER_ID` before flashing each headband. Keep it inside the `HeadImpactMonitor` folder; the Arduino IDE needs the folder and file names to match.
 - `receiver/head_impact_receiver.py` – Python BLE receiver, 3D head view, and impact logger.
 
 The sketch and the receiver must be from the same version: the receiver expects 47-byte packets (`<10fIHB`: quaternion, linear acceleration, gyro, timestamp, sequence number, calibration byte) and warns if the size is wrong.
@@ -57,23 +57,35 @@ python receiver/head_impact_receiver.py
 Use `python -m pip` with the same Python that runs the script (for Anaconda on Windows, e.g. `C:/Users/<you>/anaconda3/python.exe -m pip install ...`). Laptop Bluetooth must be on; no pairing is needed.
 
 1. The script asks for the athlete name, a session name, and head size (width, depth, height in cm).
-2. It scans for "HeadImpactMonitor" and connects, reconnecting on its own if the link drops.
-3. **Tare:** 3 seconds after connecting, it zeroes the model while the wearer looks straight ahead. After the tare, all vectors use head axes: +X right, +Y forward, +Z up.
-4. The 3D view shows the head with a nose marker, the forehead sensor, and a facing arrow, plus connection, calibration, and dropped-packet status.
-5. Close the window, click **Save & quit**, or press Ctrl+C to end the session.
+2. It scans for "HeadImpactMonitor", connects, reads the headband ID (`PLAYER_ID` in the sketch), and reconnects on its own if the link drops.
+3. The window shows the 3D head (nose marker, sensor marker, facing arrow) on the left and **Front view** / **Top view** placement panels on the right, with connection, calibration, axis, zero, and dropped-packet status at the top.
 
-Buttons along the bottom of the 3D window:
+### First-time setup for a headband
+
+Do this the first time, and again whenever the board is re-mounted on the headband. Both steps are saved in `headband_setup.json` and loaded automatically next session (the sensor spot is stored relative to head size, so it fits other athletes).
+
+1. **Calibrate axes**, then follow the prompt, clicking **Capture** after each step:
+   1. Look straight ahead and hold still
+   2. Tilt the head up (nose up) about 30°
+   3. Back to center, then turn the head left about 30°
+   4. Back to center, then tilt the left ear down about 30°
+
+   This measures how the board is turned on the head, so any mounting works. Step 1 also zeroes the model. Movements under 10°, movements that aren't separate enough, or ones in the wrong direction are rejected with a message to redo.
+2. **Place sensor**, then click where the sensor sits on the athlete's head in the Front view or Top view. The Front view is drawn as if you are facing the athlete, so their right side is on your left. The spot sets the sensor marker and the lever arm used for head-center acceleration.
+
+Until the axes are calibrated, the receiver falls back to assuming the board sits flat on the forehead with the chip facing out (`SENSOR_FORWARD_AXIS`).
+
+### Buttons
 
 | Button | What it does |
 |---|---|
-| Zero head (T) | Re-zeroes the model to the current pose; the wearer should look straight ahead. The T key does the same |
-| Reset view | Returns the camera to the default angle and zoom |
-| Front view / Side view / Top view | Looks at the face, the right side, or down from above |
+| Calibrate axes | Starts the 4-step axis wizard |
+| Capture | Records the current pose for the wizard step (refused until real sensor data arrives) |
+| Zero head (T) | Makes the current pose "looking straight ahead". Also runs automatically 3 s after the first connection |
+| Place sensor | Next click on the Front or Top view sets where the sensor sits |
+| Recal ESP32 | Tells the ESP32 to erase its saved calibration and restart the BNO055; then redo the calibration movements and click Zero head |
 | Save & quit | Closes the window and saves the CSV and session summary |
-
-Drag in the window to rotate the camera and scroll to zoom.
-
-If nodding "yes" shows on the model as a sideways tilt, the board is mounted differently than assumed: change `SENSOR_FORWARD_AXIS` at the top of the script (default `[0, 0, 1]`, board flat on the forehead with the chip facing out).
+| Reset view, Front view, Side view, Top view | Camera angles for the 3D head (drag to rotate, scroll to zoom) |
 
 ### What the receiver records
 
@@ -84,11 +96,12 @@ Each impact is one CSV row, written the moment the hit ends (acceleration back u
 | `sessionId`, `playerName`, `timestamp` | Session, athlete, and wall-clock time of the peak |
 | `eventIntensity`, `magnitude_ms2` | Peak linear acceleration at the sensor, in g and m/s² |
 | `eventDirection`, `direction_x/y/z` | Side the hit came from, and the unit acceleration vector in head axes |
-| `head_center_g` | Estimated peak acceleration at the head center: a_c = a_s − α×r − ω×(ω×r), using the head size and sensor position. α comes from differentiating the gyro at 100 Hz, so it is noisy; treat it as an estimate |
+| `head_center_g` | Estimated peak acceleration at the head center: a_c = a_s − α×r − ω×(ω×r), where r is the placed sensor position. α comes from differentiating the gyro at 100 Hz, so it is noisy; treat it as an estimate |
 | `peak_rot_vel_dps`, `peak_rot_acc_rads2` | Peak rotational velocity (deg/s) and acceleration (rad/s²) |
 | `duration_ms`, `samples` | How long the hit lasted and how many samples it spans |
 | `at_sensor_limit` | `yes` when the peak reached the BNO055's 4 g ceiling |
-| `tared`, `calibration` | Whether head axes were set, and calibration levels at the time |
+| `sensor_x_cm`, `sensor_y_cm`, `sensor_z_cm` | Sensor position on the head used for that impact |
+| `axis_setup`, `zeroed`, `calibration`, `device_id` | How the axes were set (`wizard`, `assumed`, or `none`), whether the head was zeroed, calibration levels, and the headband ID |
 
 ## Loading data into the dashboard
 
@@ -97,6 +110,6 @@ Upload the `impact_log_*.csv` on the dashboard's Intake page. It is read as writ
 ## Known limitations
 
 - In fusion (NDOF) mode the BNO055 caps acceleration at ±4 g and outputs at 100 Hz, so real head impacts are clipped. A high-g accelerometer such as the ADXL375 on the same I2C bus would fix this.
-- Impact sides depend on the tare and on `SENSOR_FORWARD_AXIS` matching how the board is worn.
-- The head center is approximated by the center of the ellipsoid model, and the sensor position by a point on the forehead (`SENSOR_HEIGHT_FRACTION`).
+- Impact sides are only as good as the axis calibration and zero; redo both after re-mounting the board.
+- The head center is approximated by the center of the ellipsoid model, and the sensor lies on the ellipsoid surface where it was placed.
 - Impacts only reach the PC while the receiver is connected; the ESP32 does not store hits on its own.
