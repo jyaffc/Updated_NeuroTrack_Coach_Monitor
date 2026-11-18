@@ -16,52 +16,52 @@
 // REQUIRED LIBRARIES (install via Sketch > Include Library > Manage Libraries):
 //   1. Adafruit BNO055          - search "Adafruit BNO055"
 //   2. Adafruit Unified Sensor  - search "Adafruit Unified Sensor"
-//      (installs automatically as a dependency of BNO055 but install manually
-//       if you get a compile error about Adafruit_Sensor.h not found)
-//   3. ESP32 BLE Arduino        - already included in the ESP32 board package,
-//                                 no separate install needed
+//   3. ESP32 BLE Arduino and Preferences come with the ESP32 board package
 //
-// WIRING (breadboard, matches wiring diagram):
+// WIRING (breadboard):
 //   BNO055 VIN  ->  ESP32 3V3       (power - must be 3.3V not 5V)
 //   BNO055 GND  ->  ESP32 GND       (ground)
 //   BNO055 SDA  ->  ESP32 GPIO 21   (I2C data)
 //   BNO055 SCL  ->  ESP32 GPIO 22   (I2C clock)
 //   BNO055 ADR  ->  ESP32 GND       (sets I2C address to 0x28)
-//   BNO055 INT  ->  not connected
-//   BNO055 RST  ->  not connected
-//   BNO055 PS0  ->  not connected
-//   BNO055 PS1  ->  not connected
+//   BNO055 INT, RST, PS0, PS1 -> not connected
 //
 // HOW TO UPLOAD:
-//   1. Connect ESP32 to PC via USB
-//   2. Select the correct COM port in Tools > Port
-//   3. Hold the BOOT button on the ESP32, click Upload in Arduino IDE,
-//      release BOOT once "Connecting..." appears in the console
-//      (some boards upload without needing this - try without first)
-//   4. Once upload completes, press the EN (reset) button on the ESP32
-//   5. Open Serial Monitor at 115200 baud to watch calibration output
+//   1. Connect ESP32 to PC via USB (data cable, not charge-only)
+//   2. Select the COM port that appears in Tools > Port
+//   3. Click Upload. If it does not connect, hold BOOT and release it once
+//      "Connecting..." appears in the console
+//   4. Press EN (reset) and open Serial Monitor at 115200 baud
 //
-// FIRST RUN - CALIBRATION:
-//   The BNO055 must be calibrated before orientation data is reliable.
-//   Watch the Serial Monitor for calibration status: Sys/Gyro/Accel/Mag
-//   Each number goes from 0 (uncalibrated) to 3 (fully calibrated).
-//   - For gyroscope: set the device flat and completely still for ~2 seconds
-//   - For accelerometer: hold in 6 different orientations (all faces)
-//   - For magnetometer: move in a figure-8 pattern slowly in the air
-//   - System reaches 3 once all subsystems are sufficiently calibrated
-//   Minimum to stream reliable data: Sys >= 1, Gyro >= 1
+// CALIBRATION:
+//   Serial Monitor shows Sys/Gyro/Accel/Mag calibration, each 0 (none) to 3 (full).
+//   - Gyroscope:     hold the headband completely still for ~2 seconds
+//   - Accelerometer: hold it in 6 different orientations, a moment each
+//   - Magnetometer:  move it slowly in a figure-8
+//   Once all four reach 3, the offsets are SAVED to the ESP32's flash and
+//   restored on every power-up, so later sessions only need a short figure-8
+//   for the magnetometer. To erase the saved calibration, hold the BOOT
+//   button for 3 seconds while the sketch is running.
 //
-// BLE DATA FORMAT:
-//   Each BLE notification is a 44-byte binary packet (IMUPacket struct).
-//   The Python receiver unpacks this with struct.unpack("<10fI", data).
-//   Packet layout:
-//     bytes  0-15 : qw, qx, qy, qz         (float32 x4) quaternion
-//     bytes 16-27 : linAccX, linAccY, linAccZ (float32 x3) m/s^2
-//     bytes 28-39 : gyroX, gyroY, gyroZ    (float32 x3) deg/s
-//     bytes 40-43 : timestamp              (uint32) ms since boot
+// BLE DATA FORMAT (47 bytes per notification, little-endian):
+//   bytes  0-15 : qw, qx, qy, qz            (float32 x4) orientation quaternion
+//   bytes 16-27 : linAccX, linAccY, linAccZ (float32 x3) m/s^2, gravity removed
+//   bytes 28-39 : gyroX, gyroY, gyroZ       (float32 x3) deg/s
+//   bytes 40-43 : timestamp                 (uint32)  ms since boot
+//   bytes 44-45 : sequence                  (uint16)  counts up by 1 per packet
+//   byte  46    : calibration               (uint8)   sys<<6 | gyro<<4 | accel<<2 | mag
+//   Python unpacks this with struct.unpack("<10fIHB", data)
+//   All vectors are in the sensor's own axes; the Python receiver rotates them
+//   into head axes after the "tare" (zeroing) step.
+//
+// KNOWN LIMIT:
+//   In NDOF fusion mode the BNO055 accelerometer is fixed at +/-4 g, so impacts
+//   stronger than ~4 g are clipped. A high-g accelerometer (e.g. ADXL375) on
+//   the same I2C bus is needed to measure real impact peaks.
 // =============================================================================
 
 #include <Wire.h>
+#include <Preferences.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
 #include <utility/imumaths.h>
@@ -72,101 +72,94 @@
 
 // =============================================================================
 // CONFIGURATION
-// Only change these if your hardware setup differs from the wiring diagram
 // =============================================================================
 
-// BNO055 I2C address
-// 0x28 -> ADR pin tied to GND (our wiring)
-// 0x29 -> ADR pin tied to 3V3
+// BNO055 I2C address: 0x28 with ADR tied to GND (our wiring), 0x29 with ADR high
 #define BNO055_I2C_ADDR  0x28
 
-// Sampling interval in milliseconds
-// 10ms = 100Hz which is the maximum the BNO055 fusion output supports
+// I2C clock: 400 kHz makes each sensor read about 4x faster than the default
+// 100 kHz. If you see "BNO055 not detected" or garbage values, change to 100000.
+#define I2C_CLOCK_HZ  400000
+
+// Sampling interval: 10 ms = 100 Hz, the BNO055's maximum fusion output rate
 #define SAMPLE_INTERVAL_MS  10
 
-// BLE device name - the Python script scans for exactly this string
+// How often the calibration status is re-read from the BNO055 (ms)
+#define CAL_REFRESH_MS  250
+
+// BLE device name and UUIDs - must match the Python receiver exactly
 #define BLE_DEVICE_NAME  "HeadImpactMonitor"
+#define SERVICE_UUID     "12345678-1234-1234-1234-123456789abc"
+#define CHAR_UUID_IMU    "abcd1234-ab12-ab12-ab12-abcdef123456"
 
-// BLE service and characteristic UUIDs
-// These must match exactly in the Python receiver script
-#define SERVICE_UUID    "12345678-1234-1234-1234-123456789abc"
-#define CHAR_UUID_IMU   "abcd1234-ab12-ab12-ab12-abcdef123456"
+// Requested BLE packet size limit (MTU). The default allows only 20 bytes per
+// notification; 185 leaves room for the 47-byte packet on any PC.
+#define BLE_MTU  185
 
-// Local impact pre-alert threshold in m/s^2 for serial monitor printout only
-// The BNO055 removes gravity so this is net dynamic acceleration
-// 9.81 m/s^2 = 1g, so 14.7 = 1.5g
-// Tune this value after testing once hardware is assembled
+// Serial Monitor alert threshold in m/s^2 (debug only; Python does the real
+// impact detection). 14.7 m/s^2 = 1.5 g of net acceleration.
 #define IMPACT_ACCEL_THRESHOLD_MS2  14.7f
+
+// BOOT button (GPIO 0): hold for this long while running to erase saved calibration
+#define BOOT_BUTTON_PIN      0
+#define CAL_ERASE_HOLD_MS    3000
+
+// Preferences (flash storage) namespace and key for the calibration offsets
+#define PREFS_NAMESPACE  "bno055"
+#define PREFS_KEY        "offsets"
 
 
 // =============================================================================
 // IMU DATA PACKET STRUCTURE
-//
-// This struct defines the exact 44-byte binary layout of each BLE transmission.
-// #pragma pack(push, 1) tells the compiler to use no padding bytes between
-// struct members - without this the compiler may insert invisible padding bytes
-// that would shift the byte positions and corrupt the Python unpacking.
-//
-// Python unpacks with: struct.unpack("<10fI", raw_data)
-//   "<"  = little-endian byte order (ESP32 is little-endian)
-//   "10f" = ten 32-bit floats
-//   "I"  = one unsigned 32-bit integer
+// #pragma pack(push, 1) removes padding so the byte layout matches the
+// Python format string "<10fIHB" exactly (47 bytes).
 // =============================================================================
 #pragma pack(push, 1)
 struct IMUPacket {
-    float    qw;          // Quaternion scalar (w) component
-    float    qx;          // Quaternion vector (x) component
-    float    qy;          // Quaternion vector (y) component
-    float    qz;          // Quaternion vector (z) component
-    float    linAccX;     // Linear acceleration X in m/s^2 (gravity removed)
-    float    linAccY;     // Linear acceleration Y in m/s^2
-    float    linAccZ;     // Linear acceleration Z in m/s^2
-    float    gyroX;       // Angular velocity X in deg/s
-    float    gyroY;       // Angular velocity Y in deg/s
-    float    gyroZ;       // Angular velocity Z in deg/s
-    uint32_t timestamp;   // Time in milliseconds since device power-on
+    float    qw, qx, qy, qz;          // Quaternion (sensor orientation)
+    float    linAccX, linAccY, linAccZ; // Linear acceleration in m/s^2 (gravity removed)
+    float    gyroX, gyroY, gyroZ;     // Angular velocity in deg/s
+    uint32_t timestamp;               // ms since power-on
+    uint16_t sequence;                // Packet counter, lets Python detect dropped packets
+    uint8_t  calibration;             // Packed calibration levels (see header)
 };
 #pragma pack(pop)
+
+// Compile-time check that the packet is exactly 47 bytes
+static_assert(sizeof(IMUPacket) == 47, "IMUPacket must be 47 bytes");
 
 
 // =============================================================================
 // GLOBAL OBJECTS AND STATE
 // =============================================================================
 
-// BNO055 sensor object
-// First argument: arbitrary unique sensor ID used internally by Adafruit library
-// Second argument: I2C address
 Adafruit_BNO055 bno = Adafruit_BNO055(55, BNO055_I2C_ADDR);
+Preferences     prefs;
 
-// BLE server and characteristic - assigned during setup(), used in loop()
 BLEServer*         pServer            = nullptr;
 BLECharacteristic* pIMUCharacteristic = nullptr;
 
-// BLE connection state flags
-// deviceConnected:    true while a Python client is actively connected
-// oldDeviceConnected: previous frame's connection state, used to detect changes
-bool deviceConnected    = false;
-bool oldDeviceConnected = false;
+bool deviceConnected    = false;   // true while the Python client is connected
+bool oldDeviceConnected = false;   // previous state, used to detect changes
 
-// Calibration status variables (0-3 scale, 3 = fully calibrated)
-uint8_t calSys, calGyro, calAccel, calMag;
+// Latest calibration levels (0-3 each)
+uint8_t calSys = 0, calGyro = 0, calAccel = 0, calMag = 0;
+
+bool     calibrationSavedThisBoot = false; // save offsets at most once per power-up
+uint16_t packetSequence           = 0;     // increments with every BLE packet
 
 
 // =============================================================================
 // BLE SERVER CALLBACKS
-// These methods are called automatically by the ESP32 BLE stack when the
-// Python client connects or disconnects. No manual polling needed.
+// Called by the ESP32 BLE stack when the Python client connects or disconnects
 // =============================================================================
 class ServerCallbacks : public BLEServerCallbacks {
-
-    // Triggered when Python client connects via BLE
-    void onConnect(BLEServer* pServer) override {
+    void onConnect(BLEServer* server) override {
         deviceConnected = true;
         Serial.println("[BLE] Client connected - streaming started");
     }
 
-    // Triggered when Python client disconnects or connection is lost
-    void onDisconnect(BLEServer* pServer) override {
+    void onDisconnect(BLEServer* server) override {
         deviceConnected = false;
         Serial.println("[BLE] Client disconnected - restarting advertising");
     }
@@ -174,12 +167,63 @@ class ServerCallbacks : public BLEServerCallbacks {
 
 
 // =============================================================================
-// SETUP - Runs once on power-on or after pressing the EN (reset) button
+// CALIBRATION STORAGE
+// =============================================================================
+
+// Loads saved offsets from flash into the BNO055, if any were saved before.
+// Must run after bno.begin(); the library switches to config mode internally.
+void restoreCalibration() {
+    prefs.begin(PREFS_NAMESPACE, true);  // true = read-only
+    if (prefs.getBytesLength(PREFS_KEY) == sizeof(adafruit_bno055_offsets_t)) {
+        adafruit_bno055_offsets_t offsets;
+        prefs.getBytes(PREFS_KEY, &offsets, sizeof(offsets));
+        bno.setSensorOffsets(offsets);
+        Serial.println("[CAL] Saved calibration restored from flash");
+        Serial.println("      Move the headband in a short figure-8 to settle the magnetometer");
+    } else {
+        Serial.println("[CAL] No saved calibration yet - do the full calibration routine");
+    }
+    prefs.end();
+}
+
+// Saves the current offsets to flash. getSensorOffsets() only succeeds when
+// the sensor reports full calibration, so partial offsets are never stored.
+void saveCalibration() {
+    adafruit_bno055_offsets_t offsets;
+    if (bno.getSensorOffsets(offsets)) {
+        prefs.begin(PREFS_NAMESPACE, false);  // false = read/write
+        prefs.putBytes(PREFS_KEY, &offsets, sizeof(offsets));
+        prefs.end();
+        calibrationSavedThisBoot = true;
+        Serial.println("[CAL] Full calibration saved to flash");
+    }
+}
+
+// Erases the saved offsets (triggered by holding the BOOT button)
+void eraseCalibration() {
+    prefs.begin(PREFS_NAMESPACE, false);
+    prefs.remove(PREFS_KEY);
+    prefs.end();
+    calibrationSavedThisBoot = false;
+    Serial.println("[CAL] Saved calibration erased - recalibrate from scratch");
+}
+
+// Reads the four calibration levels from the BNO055
+void refreshCalibration() {
+    bno.getCalibration(&calSys, &calGyro, &calAccel, &calMag);
+}
+
+// Packs the four 0-3 levels into one byte: sys<<6 | gyro<<4 | accel<<2 | mag
+uint8_t packedCalibration() {
+    return (uint8_t)(((calSys & 0x3) << 6) | ((calGyro & 0x3) << 4) |
+                     ((calAccel & 0x3) << 2) | (calMag & 0x3));
+}
+
+
+// =============================================================================
+// SETUP - Runs once on power-on or after pressing EN
 // =============================================================================
 void setup() {
-
-    // Start serial communication for debug output
-    // Open Serial Monitor in Arduino IDE at this baud rate to see output
     Serial.begin(115200);
     delay(500);
     Serial.println();
@@ -187,229 +231,159 @@ void setup() {
     Serial.println("  HeadImpactMonitor - ESP32-SOLO-1 + BNO055");
     Serial.println("==============================================");
 
-    // -------------------------------------------------------------------------
-    // Initialize I2C bus
-    // ESP32 default I2C pins: SDA = GPIO 21, SCL = GPIO 22
-    // These match our wiring diagram - no custom pin config needed
-    // -------------------------------------------------------------------------
-    Wire.begin();
-    Serial.println("[I2C] Bus initialized on GPIO 21 (SDA), GPIO 22 (SCL)");
+    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);  // BOOT button reads LOW when pressed
 
-    // -------------------------------------------------------------------------
-    // Initialize BNO055 sensor
-    // bno.begin() returns false if the sensor is not detected on I2C
-    // If this fails, check: wiring, VIN=3.3V, ADR pin, I2C address (0x28/0x29)
-    // -------------------------------------------------------------------------
+    // --- BNO055 over I2C (GPIO 21 = SDA, GPIO 22 = SCL) ---
     Serial.print("[IMU] Initializing BNO055 at I2C address 0x");
     Serial.println(BNO055_I2C_ADDR, HEX);
 
-    if (!bno.begin()) {
+    if (!bno.begin()) {   // begin() also starts the I2C bus
         Serial.println("[ERROR] BNO055 not detected. Check wiring:");
         Serial.println("        VIN -> 3V3, GND -> GND");
         Serial.println("        SDA -> GPIO 21, SCL -> GPIO 22");
         Serial.println("        ADR -> GND (for address 0x28)");
         Serial.println("  Halting. Fix wiring and press EN to retry.");
         while (true) {
-            delay(1000); // Halt here - do not proceed without IMU
+            delay(1000);
         }
     }
+    Wire.setClock(I2C_CLOCK_HZ);  // Faster reads once the sensor is found
+    Serial.println("[IMU] BNO055 detected (NDOF fusion mode, 100 Hz)");
 
-    Serial.println("[IMU] BNO055 detected successfully");
+    // Restore saved calibration before switching on the external crystal
+    restoreCalibration();
+    bno.setExtCrystalUse(true);  // More accurate timing for the fusion algorithm
 
-    // Use the external 32.768 kHz crystal on the Adafruit breakout board
-    // for better timing accuracy in the internal sensor fusion algorithm
-    bno.setExtCrystalUse(true);
-    Serial.println("[IMU] External crystal enabled");
-
-    // The BNO055 defaults to NDOF (Nine Degrees Of Freedom) fusion mode
-    // In NDOF mode the chip internally fuses accelerometer + gyroscope +
-    // magnetometer to output a calibrated absolute orientation quaternion.
-    // This runs entirely on the BNO055 chip - the ESP32 just reads the result.
-    Serial.println("[IMU] Fusion mode: NDOF (9-DOF absolute orientation)");
-    Serial.println("[IMU] Sampling rate: 100 Hz (10ms interval)");
-
-    // -------------------------------------------------------------------------
-    // Initialize BLE
-    // -------------------------------------------------------------------------
+    // --- BLE ---
     BLEDevice::init(BLE_DEVICE_NAME);
-    Serial.print("[BLE] Device initialized as: ");
-    Serial.println(BLE_DEVICE_NAME);
+    BLEDevice::setMTU(BLE_MTU);  // Allow packets larger than the 20-byte default
 
-    // Create BLE server and attach connection/disconnection callbacks
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new ServerCallbacks());
 
-    // Create a BLE service - a logical container for related characteristics
     BLEService* pService = pServer->createService(SERVICE_UUID);
 
-    // Create the IMU data characteristic inside the service
-    // PROPERTY_NOTIFY: server pushes data to client automatically without
-    // the client needing to request/poll each value
+    // NOTIFY: the ESP32 pushes each packet without the PC having to ask
     pIMUCharacteristic = pService->createCharacteristic(
         CHAR_UUID_IMU,
         BLECharacteristic::PROPERTY_NOTIFY
     );
-
-    // BLE2902 is the standard Client Characteristic Configuration Descriptor
-    // Required for NOTIFY to function - allows the Python client to subscribe
-    pIMUCharacteristic->addDescriptor(new BLE2902());
-
-    // Start the service (makes the characteristic visible to connecting clients)
+    pIMUCharacteristic->addDescriptor(new BLE2902());  // Lets the client subscribe
     pService->start();
 
-    // Begin advertising so the Python script can discover the device
     BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
     pAdvertising->setScanResponse(true);
     BLEDevice::startAdvertising();
 
-    Serial.println("[BLE] Advertising started - Python script can now connect");
+    Serial.print("[BLE] Advertising as ");
+    Serial.println(BLE_DEVICE_NAME);
     Serial.println();
     Serial.println("----------------------------------------------");
-    Serial.println("  CALIBRATION - move device to calibrate:");
+    Serial.println("  CALIBRATION");
     Serial.println("  Gyro:  hold completely still for 2 seconds");
-    Serial.println("  Accel: tilt to 6 different orientations");
-    Serial.println("  Mag:   move in slow figure-8 pattern");
-    Serial.println("  Target: Sys=3 Gyro=3 Accel=3 Mag=3");
-    Serial.println("  Minimum to stream: Sys>=1, Gyro>=1");
+    Serial.println("  Accel: hold in 6 different orientations");
+    Serial.println("  Mag:   move in a slow figure-8");
+    Serial.println("  Full calibration (3/3/3/3) is saved automatically");
+    Serial.println("  Hold BOOT for 3 s to erase saved calibration");
     Serial.println("----------------------------------------------");
     Serial.println();
 }
 
 
 // =============================================================================
-// LOOP - Runs continuously after setup() completes
+// LOOP
 // =============================================================================
 void loop() {
-
-    // Timestamps for controlling sample rate and calibration print rate
-    static uint32_t lastSampleTime  = 0;
+    static uint32_t lastSampleTime   = 0;
+    static uint32_t lastCalRefresh   = 0;
     static uint32_t lastCalPrintTime = 0;
+    static uint32_t bootPressedSince = 0;
 
-    uint32_t now = millis(); // Current time in ms since power-on
+    uint32_t now = millis();
 
-    // -------------------------------------------------------------------------
-    // BLE Reconnection Handler
-    // Detects when a client disconnects and restarts advertising automatically
-    // so the Python script can reconnect without rebooting the ESP32
-    // -------------------------------------------------------------------------
+    // --- BLE reconnection: restart advertising after the client leaves ---
     if (!deviceConnected && oldDeviceConnected) {
-        // Client just disconnected - wait briefly for BLE stack to clean up
-        delay(500);
+        delay(500);  // Give the BLE stack time to clean up
         pServer->startAdvertising();
         oldDeviceConnected = false;
         Serial.println("[BLE] Advertising restarted - waiting for reconnection");
     }
-
-    // Track when a new connection is established
     if (deviceConnected && !oldDeviceConnected) {
         oldDeviceConnected = true;
-        Serial.println("[BLE] New connection established");
+        packetSequence = 0;  // Restart the counter for each connection
     }
 
-    // -------------------------------------------------------------------------
-    // Calibration Status Printout (when not streaming)
-    // Prints every 2 seconds so you can monitor calibration progress
-    // in the Arduino IDE Serial Monitor before connecting the Python script
-    // -------------------------------------------------------------------------
-    if (!deviceConnected && (now - lastCalPrintTime >= 2000)) {
-        lastCalPrintTime = now;
+    // --- BOOT button held for 3 s: erase saved calibration ---
+    if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+        if (bootPressedSince == 0) {
+            bootPressedSince = now;
+        } else if (now - bootPressedSince >= CAL_ERASE_HOLD_MS) {
+            eraseCalibration();
+            bootPressedSince = 0;
+            while (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+                delay(10);  // Wait for release so it erases only once
+            }
+        }
+    } else {
+        bootPressedSince = 0;
+    }
 
-        // getCalibration fills each variable with a value 0-3
-        bno.getCalibration(&calSys, &calGyro, &calAccel, &calMag);
-
-        Serial.print("[CAL] Sys:");
-        Serial.print(calSys);
-        Serial.print("  Gyro:");
-        Serial.print(calGyro);
-        Serial.print("  Accel:");
-        Serial.print(calAccel);
-        Serial.print("  Mag:");
-        Serial.println(calMag);
-
-        if (calSys >= 1 && calGyro >= 1) {
-            Serial.println("      Ready - run Python script to connect");
-        } else {
-            Serial.println("      Still calibrating...");
+    // --- Calibration: refresh levels and save once fully calibrated ---
+    if (now - lastCalRefresh >= CAL_REFRESH_MS) {
+        lastCalRefresh = now;
+        refreshCalibration();
+        if (!calibrationSavedThisBoot && calSys == 3 && calGyro == 3 &&
+            calAccel == 3 && calMag == 3) {
+            saveCalibration();
         }
     }
 
-    // -------------------------------------------------------------------------
-    // IMU Sampling and BLE Streaming
-    // Runs at SAMPLE_INTERVAL_MS (10ms = 100Hz) only when a client is connected
-    // -------------------------------------------------------------------------
+    // Print calibration every 2 s while waiting for the Python client
+    if (!deviceConnected && (now - lastCalPrintTime >= 2000)) {
+        lastCalPrintTime = now;
+        Serial.printf("[CAL] Sys:%u  Gyro:%u  Accel:%u  Mag:%u", calSys, calGyro, calAccel, calMag);
+        Serial.println((calSys >= 1 && calGyro >= 1)
+                           ? "   Ready - run the Python receiver"
+                           : "   Still calibrating...");
+    }
+
+    // --- Sampling and streaming at 100 Hz while connected ---
     if (deviceConnected && (now - lastSampleTime >= SAMPLE_INTERVAL_MS)) {
         lastSampleTime = now;
 
-        // -- Read quaternion (absolute 3D orientation from fusion algorithm) --
-        // The quaternion represents a rotation in 3D space without gimbal lock.
-        // Components: w (scalar), x y z (vector). Unit quaternion: w^2+x^2+y^2+z^2=1
+        // Orientation from the BNO055's on-chip sensor fusion
         imu::Quaternion quat = bno.getQuat();
-
-        // -- Read linear acceleration (dynamic acceleration, gravity removed) --
-        // The BNO055 subtracts the gravity vector internally using the quaternion,
-        // leaving only the net dynamic force from head movement or impact.
-        // Units: m/s^2
+        // Acceleration with gravity removed (m/s^2), in sensor axes
         imu::Vector<3> linAccel = bno.getVector(Adafruit_BNO055::VECTOR_LINEARACCEL);
-
-        // -- Read gyroscope (angular velocity) --
-        // Rate of rotation around each axis. Units: degrees per second (deg/s)
+        // Angular velocity (deg/s), in sensor axes
         imu::Vector<3> gyro = bno.getVector(Adafruit_BNO055::VECTOR_GYROSCOPE);
 
-        // -- Build and send the data packet --
         IMUPacket packet;
-        packet.qw        = (float)quat.w();
-        packet.qx        = (float)quat.x();
-        packet.qy        = (float)quat.y();
-        packet.qz        = (float)quat.z();
-        packet.linAccX   = (float)linAccel.x();
-        packet.linAccY   = (float)linAccel.y();
-        packet.linAccZ   = (float)linAccel.z();
-        packet.gyroX     = (float)gyro.x();
-        packet.gyroY     = (float)gyro.y();
-        packet.gyroZ     = (float)gyro.z();
-        packet.timestamp = now;
+        packet.qw          = (float)quat.w();
+        packet.qx          = (float)quat.x();
+        packet.qy          = (float)quat.y();
+        packet.qz          = (float)quat.z();
+        packet.linAccX     = (float)linAccel.x();
+        packet.linAccY     = (float)linAccel.y();
+        packet.linAccZ     = (float)linAccel.z();
+        packet.gyroX       = (float)gyro.x();
+        packet.gyroY       = (float)gyro.y();
+        packet.gyroZ       = (float)gyro.z();
+        packet.timestamp   = now;
+        packet.sequence    = packetSequence++;
+        packet.calibration = packedCalibration();
 
-        // Cast the struct to a raw byte array for BLE transmission
-        // sizeof(IMUPacket) = 44 bytes
-        // Python receives this and calls struct.unpack("<10fI", raw_data)
         pIMUCharacteristic->setValue((uint8_t*)&packet, sizeof(IMUPacket));
         pIMUCharacteristic->notify();
 
-        // -- Local serial impact alert (debug only) --
-        // Full impact analysis with history logging is done in the Python script
-        // This is just so you can see high-G events in the Serial Monitor
-        float accelMagnitude = sqrtf(
-            packet.linAccX * packet.linAccX +
-            packet.linAccY * packet.linAccY +
-            packet.linAccZ * packet.linAccZ
-        );
-
+        // Serial alert for strong accelerations (debug only)
+        float accelMagnitude = sqrtf(packet.linAccX * packet.linAccX +
+                                     packet.linAccY * packet.linAccY +
+                                     packet.linAccZ * packet.linAccZ);
         if (accelMagnitude > IMPACT_ACCEL_THRESHOLD_MS2) {
-            Serial.print("[ALERT] High accel: ");
-            Serial.print(accelMagnitude);
-            Serial.print(" m/s^2 (");
-            Serial.print(accelMagnitude / 9.81f);
-            Serial.print("g) at t=");
-            Serial.print(now);
-            Serial.println("ms");
+            Serial.printf("[ALERT] %.2f m/s^2 (%.2f g) at t=%lu ms\n",
+                          accelMagnitude, accelMagnitude / 9.81f, (unsigned long)now);
         }
-
-        // -- Verbose debug output (uncomment the block below if needed) --
-        // Warning: printing at 100Hz will flood the Serial Monitor
-        // Comment back out before running with the Python script connected
-        /*
-        Serial.print("t=");     Serial.print(now);
-        Serial.print(" qw=");   Serial.print(packet.qw, 3);
-        Serial.print(" qx=");   Serial.print(packet.qx, 3);
-        Serial.print(" qy=");   Serial.print(packet.qy, 3);
-        Serial.print(" qz=");   Serial.print(packet.qz, 3);
-        Serial.print(" ax=");   Serial.print(packet.linAccX, 2);
-        Serial.print(" ay=");   Serial.print(packet.linAccY, 2);
-        Serial.print(" az=");   Serial.print(packet.linAccZ, 2);
-        Serial.print(" gx=");   Serial.print(packet.gyroX, 1);
-        Serial.print(" gy=");   Serial.print(packet.gyroY, 1);
-        Serial.print(" gz=");   Serial.println(packet.gyroZ, 1);
-        */
     }
 }
