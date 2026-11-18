@@ -37,6 +37,7 @@ import time
 
 import matplotlib.animation as animation
 import matplotlib.pyplot as plt
+from matplotlib.widgets import Button                       # clickable buttons in the window
 import numpy as np
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection   # 3D polygons for the head
 from bleak import BleakClient, BleakScanner
@@ -485,6 +486,13 @@ def run_view(session, link, head_cm):
     limit = float(max(rx, ry, rz)) * 1.7
     ax.set_xlim(-limit, limit); ax.set_ylim(-limit, limit); ax.set_zlim(-limit, limit)
     ax.set_box_aspect((1, 1, 1))
+
+    def set_camera(elev, azim):
+        """Point the camera and restore the default zoom (undoes scroll zoom)."""
+        ax.set_xlim(-limit, limit); ax.set_ylim(-limit, limit); ax.set_zlim(-limit, limit)
+        ax.view_init(elev=elev, azim=azim)
+        fig.canvas.draw_idle()
+
     ax.view_init(elev=15, azim=60)        # camera in front of and right of the face
     ax.computed_zorder = False            # draw markers on top of the head
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
@@ -493,8 +501,9 @@ def run_view(session, link, head_cm):
     ax.set_ylabel("Y  forward (cm)", color="#cccccc")
     ax.set_zlabel("Z  up (cm)", color="#cccccc")
     ax.tick_params(colors="#888888")
-    ax.set_title("Head Impact Monitor - live orientation   (press T to re-zero)",
+    ax.set_title("Head Impact Monitor - live orientation",
                  color="white", fontsize=11, pad=12)
+    fig.subplots_adjust(bottom=0.14)      # leave room for the button row
 
     skin, red = np.array([0.78, 0.66, 0.51]), np.array([1.0, 0.2, 0.2])
     head = Poly3DCollection(points.T[faces], linewidths=0, zorder=1)
@@ -544,10 +553,42 @@ def run_view(session, link, head_cm):
         counter.set_text(f"Impacts: {count}")
         return head, nose_dot, sensor_mk, facing_ln
 
+    # ------------------------------------------------------------------
+    # Buttons along the bottom of the window
+    # ------------------------------------------------------------------
+    def zero_head(_event=None):
+        """Tare: the current head pose becomes 'looking straight ahead'."""
+        if not link.connected:
+            print("[TARE] Not connected yet - zeroing will run once the headband connects")
+        session.request_tare()
+        print("[TARE] Re-zeroing on the next packet - keep looking straight ahead")
+
+    def save_and_quit(_event=None):
+        """Close the window; the main program then saves the CSV and summary."""
+        plt.close(fig)
+
+    button_specs = [
+        ("Zero head (T)", zero_head),
+        ("Reset view",    lambda _e: set_camera(15, 60)),
+        ("Front view",    lambda _e: set_camera(0, 90)),    # camera facing the face
+        ("Side view",     lambda _e: set_camera(0, 0)),     # camera at the wearer's right
+        ("Top view",      lambda _e: set_camera(90, 90)),   # camera above, face toward top of screen
+        ("Save & quit",   save_and_quit),
+    ]
+    buttons = []
+    width, gap, left = 0.14, 0.015, 0.035
+    for index, (label, callback) in enumerate(button_specs):
+        button_ax = fig.add_axes([left + index * (width + gap), 0.025, width, 0.06])
+        button = Button(button_ax, label, color="#2a2a44", hovercolor="#3d3d66")
+        button.label.set_color("white")
+        button.label.set_fontsize(9)
+        button.on_clicked(callback)
+        buttons.append(button)
+    fig._buttons = buttons   # keep references, or the buttons stop responding
+
     def on_key(event):
         if event.key in ("t", "T"):
-            session.request_tare()
-            print("[TARE] Re-zeroing on the next packet - keep looking straight ahead")
+            zero_head()
 
     fig.canvas.mpl_connect("key_press_event", on_key)
     # Keep a reference so the animation is not garbage-collected

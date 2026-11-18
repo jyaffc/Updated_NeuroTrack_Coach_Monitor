@@ -58,9 +58,20 @@ Use `python -m pip` with the same Python that runs the script (for Anaconda on W
 
 1. The script asks for the athlete name, a session name, and head size (width, depth, height in cm).
 2. It scans for "HeadImpactMonitor" and connects, reconnecting on its own if the link drops.
-3. **Tare:** 3 seconds after connecting, it zeroes the model while the wearer looks straight ahead. Press **T** in the 3D window to re-zero. After the tare, all vectors use head axes: +X right, +Y forward, +Z up.
+3. **Tare:** 3 seconds after connecting, it zeroes the model while the wearer looks straight ahead. After the tare, all vectors use head axes: +X right, +Y forward, +Z up.
 4. The 3D view shows the head with a nose marker, the forehead sensor, and a facing arrow, plus connection, calibration, and dropped-packet status.
-5. Close the window (or Ctrl+C) to end the session.
+5. Close the window, click **Save & quit**, or press Ctrl+C to end the session.
+
+Buttons along the bottom of the 3D window:
+
+| Button | What it does |
+|---|---|
+| Zero head (T) | Re-zeroes the model to the current pose; the wearer should look straight ahead. The T key does the same |
+| Reset view | Returns the camera to the default angle and zoom |
+| Front view / Side view / Top view | Looks at the face, the right side, or down from above |
+| Save & quit | Closes the window and saves the CSV and session summary |
+
+Drag in the window to rotate the camera and scroll to zoom.
 
 If nodding "yes" shows on the model as a sideways tilt, the board is mounted differently than assumed: change `SENSOR_FORWARD_AXIS` at the top of the script (default `[0, 0, 1]`, board flat on the forehead with the chip facing out).
 
